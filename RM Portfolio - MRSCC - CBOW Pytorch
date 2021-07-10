@@ -1,0 +1,1258 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "name": "ANLE - Assignment 1 (Pytorch CBOW embeddings v1.1)",
+      "provenance": [],
+      "collapsed_sections": []
+    },
+    "kernelspec": {
+      "display_name": "Python 3",
+      "name": "python3"
+    },
+    "accelerator": "GPU"
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "4QFwJxWp1QqQ"
+      },
+      "source": [
+        "# MRSCC\n",
+        "\n",
+        "This assignment asks us to compete in The Microsoft Research Sentence Completion Challenge - MRSCC (Zweig and Burges, 2011), it requires a system to be able to predict which is the most likely word (from a set of 5 possibilities) to complete a sentence. "
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "sTzc8oiJ2cZ4"
+      },
+      "source": [
+        "### Loading challenge data\n",
+        "\n",
+        "For this challenge we are provided with:\n",
+        "\n",
+        "1.   A training corpus of 19th century novels data (522 files)\n",
+        "2.   1040 sentences with one missing word and 5 options to choose from\n",
+        "\n",
+        "This dataset was constructed from Project Gutenberg data. Seed sentences were selected from five of Sir\n",
+        "Arthur Conan Doyle’s Sherlock Holmes novels, and then imposter words were suggested with the\n",
+        "aid of a language model trained on over 500 19th century novels. The strategy for competing in this challenge will be to create training and validation data from the complete corpus. This will then help us make predictions in the unseen MRSCC challenge data."
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "9Lb8nyXyvkSC"
+      },
+      "source": [
+        "# Data imports"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "R72d4c9LXd02"
+      },
+      "source": [
+        "%%capture\n",
+        "!sudo apt-get install libdb++-dev\n",
+        "!export BERKELEYDB_DIR=/usr\n",
+        "!pip3 install bsddb3\n",
+        "!pip install gutenberg\n",
+        "!pip install nltk\n",
+        "!pip install pytorch-lightning\n",
+        "!pip install \"ray[tune]\""
+      ],
+      "execution_count": 1,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "xw9T2bSWEocL"
+      },
+      "source": [
+        "%%capture\n",
+        "import nltk\n",
+        "nltk.download('punkt')\n",
+        "import os\n",
+        "import random\n",
+        "from nltk import word_tokenize as tokenize\n",
+        "import operator\n",
+        "import torch\n",
+        "import torch.nn as nn\n",
+        "import torch.nn.functional as F\n",
+        "import torch.optim as optim\n",
+        "from ray import tune\n",
+        "from ray.tune import CLIReporter\n",
+        "from ray.tune.schedulers import ASHAScheduler\n",
+        "from ray.tune.integration.pytorch_lightning import TuneReportCallback\n",
+        "import shutil\n",
+        "import tempfile\n",
+        "from pytorch_lightning.loggers import TensorBoardLogger\n",
+        "from pytorch_lightning.utilities.cloud_io import load as pl_load\n",
+        "import re\n",
+        "from gutenberg.acquire import load_etext\n",
+        "from gutenberg.cleanup import strip_headers\n",
+        "nltk.download('stopwords')\n",
+        "from nltk.corpus import stopwords\n",
+        "from nltk import word_tokenize\n",
+        "import string\n",
+        "import pandas as pd, csv\n",
+        "import re\n",
+        "from sklearn.model_selection import train_test_split\n",
+        "import numpy as np"
+      ],
+      "execution_count": 2,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "azj_gndV4iS0",
+        "outputId": "c72c65a9-3f43-45bd-ea2f-c922e46c7a3b"
+      },
+      "source": [
+        "import os\n",
+        "import random\n",
+        "mrscc_dir = '/content/drive/MyDrive/university/2021/ANLE/lab2resources/sentence-completion'\n",
+        "\n",
+        "def get_train_val(training_dir=mrscc_dir,split=0.99):\n",
+        "    filenames=os.listdir(training_dir)\n",
+        "    n=len(filenames)\n",
+        "    print(\"There are {} files in the training directory: {}\".format(n,training_dir))\n",
+        "    random.seed(7) #if you want the same random split every time\n",
+        "    random.shuffle(filenames)\n",
+        "    index=int(n*split)\n",
+        "    return(filenames[:index],filenames[index:])\n",
+        "\n",
+        "trainingdir=os.path.join(mrscc_dir,\"Holmes_Training_Data/\")\n",
+        "training,testing=get_train_val(trainingdir)"
+      ],
+      "execution_count": 3,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "text": [
+            "There are 522 files in the training directory: /content/drive/MyDrive/university/2021/ANLE/lab2resources/sentence-completion/Holmes_Training_Data/\n"
+          ],
+          "name": "stdout"
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "TPWqGssaXsw8"
+      },
+      "source": [
+        "def processfiles(files, training_dir, filter=\"Conan Doyle\"):\n",
+        "  texts = []\n",
+        "  for i, afile in enumerate(files):\n",
+        "      text = \"\"\n",
+        "      try:\n",
+        "          with open(os.path.join(training_dir,afile)) as instream:\n",
+        "            for line in instream:\n",
+        "              text += line\n",
+        "            if re.search(filter, text, re.IGNORECASE) or i%15==0:\n",
+        "              print(\"sherlock found at {}\".format(i))\n",
+        "              texts.append(strip_headers(text).strip())              \n",
+        "      except UnicodeDecodeError:\n",
+        "          print(\"UnicodeDecodeError processing {}: ignoring rest of file\".format(afile))\n",
+        "  return texts"
+      ],
+      "execution_count": 4,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "zzM1K-t1XvJl"
+      },
+      "source": [
+        "texts = processfiles(training, trainingdir)"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "DrpPt80BXzMV",
+        "outputId": "6f078559-6fac-4ce1-85f2-72c9df69419c"
+      },
+      "source": [
+        "len(texts)"
+      ],
+      "execution_count": 6,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "50"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 6
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "GayuJTO3eWFJ"
+      },
+      "source": [
+        "load questions"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 202
+        },
+        "id": "7n1xHRI1eWw6",
+        "outputId": "f2cac3dd-91b0-4d74-d4a8-4db107f466cf"
+      },
+      "source": [
+        "questions=pd.read_csv(os.path.join(mrscc_dir,\"testing_data.csv\"))\n",
+        "answers=pd.read_csv(os.path.join(mrscc_dir,\"test_answer.csv\"))\n",
+        "choices = ['a','b','c','d','e']\n",
+        "questions.rename(columns={'a)':'a','b)':'b','c)':'c','d)':'d','e)':'e'}, inplace=True)\n",
+        "word_answers, question_with_answer, question_with_mask = [], [], []\n",
+        "for index,row in questions.iterrows():\n",
+        "  answer = answers.iloc[index].answer\n",
+        "  word_answers.append(row[answer])\n",
+        "  question_with_answer.append(re.sub(\"_____\",row[answer],row.question))\n",
+        "questions['answer'] = word_answers\n",
+        "questions['question_with_answer'] = question_with_answer\n",
+        "questions.head()"
+      ],
+      "execution_count": 7,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/html": [
+              "<div>\n",
+              "<style scoped>\n",
+              "    .dataframe tbody tr th:only-of-type {\n",
+              "        vertical-align: middle;\n",
+              "    }\n",
+              "\n",
+              "    .dataframe tbody tr th {\n",
+              "        vertical-align: top;\n",
+              "    }\n",
+              "\n",
+              "    .dataframe thead th {\n",
+              "        text-align: right;\n",
+              "    }\n",
+              "</style>\n",
+              "<table border=\"1\" class=\"dataframe\">\n",
+              "  <thead>\n",
+              "    <tr style=\"text-align: right;\">\n",
+              "      <th></th>\n",
+              "      <th>id</th>\n",
+              "      <th>question</th>\n",
+              "      <th>a</th>\n",
+              "      <th>b</th>\n",
+              "      <th>c</th>\n",
+              "      <th>d</th>\n",
+              "      <th>e</th>\n",
+              "      <th>answer</th>\n",
+              "      <th>question_with_answer</th>\n",
+              "    </tr>\n",
+              "  </thead>\n",
+              "  <tbody>\n",
+              "    <tr>\n",
+              "      <th>0</th>\n",
+              "      <td>1</td>\n",
+              "      <td>I have it from the same source that you are bo...</td>\n",
+              "      <td>crying</td>\n",
+              "      <td>instantaneously</td>\n",
+              "      <td>residing</td>\n",
+              "      <td>matched</td>\n",
+              "      <td>walking</td>\n",
+              "      <td>residing</td>\n",
+              "      <td>I have it from the same source that you are bo...</td>\n",
+              "    </tr>\n",
+              "    <tr>\n",
+              "      <th>1</th>\n",
+              "      <td>2</td>\n",
+              "      <td>It was furnished partly as a sitting and partl...</td>\n",
+              "      <td>daintily</td>\n",
+              "      <td>privately</td>\n",
+              "      <td>inadvertently</td>\n",
+              "      <td>miserably</td>\n",
+              "      <td>comfortably</td>\n",
+              "      <td>daintily</td>\n",
+              "      <td>It was furnished partly as a sitting and partl...</td>\n",
+              "    </tr>\n",
+              "    <tr>\n",
+              "      <th>2</th>\n",
+              "      <td>3</td>\n",
+              "      <td>As I descended , my old ally , the _____ , cam...</td>\n",
+              "      <td>gods</td>\n",
+              "      <td>moon</td>\n",
+              "      <td>panther</td>\n",
+              "      <td>guard</td>\n",
+              "      <td>country-dance</td>\n",
+              "      <td>guard</td>\n",
+              "      <td>As I descended , my old ally , the guard , cam...</td>\n",
+              "    </tr>\n",
+              "    <tr>\n",
+              "      <th>3</th>\n",
+              "      <td>4</td>\n",
+              "      <td>We got off , _____ our fare , and the trap rat...</td>\n",
+              "      <td>rubbing</td>\n",
+              "      <td>doubling</td>\n",
+              "      <td>paid</td>\n",
+              "      <td>naming</td>\n",
+              "      <td>carrying</td>\n",
+              "      <td>paid</td>\n",
+              "      <td>We got off , paid our fare , and the trap ratt...</td>\n",
+              "    </tr>\n",
+              "    <tr>\n",
+              "      <th>4</th>\n",
+              "      <td>5</td>\n",
+              "      <td>He held in his hand a _____ of blue paper , sc...</td>\n",
+              "      <td>supply</td>\n",
+              "      <td>parcel</td>\n",
+              "      <td>sign</td>\n",
+              "      <td>sheet</td>\n",
+              "      <td>chorus</td>\n",
+              "      <td>sheet</td>\n",
+              "      <td>He held in his hand a sheet of blue paper , sc...</td>\n",
+              "    </tr>\n",
+              "  </tbody>\n",
+              "</table>\n",
+              "</div>"
+            ],
+            "text/plain": [
+              "   id  ...                               question_with_answer\n",
+              "0   1  ...  I have it from the same source that you are bo...\n",
+              "1   2  ...  It was furnished partly as a sitting and partl...\n",
+              "2   3  ...  As I descended , my old ally , the guard , cam...\n",
+              "3   4  ...  We got off , paid our fare , and the trap ratt...\n",
+              "4   5  ...  He held in his hand a sheet of blue paper , sc...\n",
+              "\n",
+              "[5 rows x 9 columns]"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 7
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "z_qOvgSv6Xu9",
+        "outputId": "ec88e818-deac-4d8c-abac-b3bc07605167"
+      },
+      "source": [
+        "nltk.download('wordnet')\n",
+        "from nltk.corpus import wordnet as wn"
+      ],
+      "execution_count": 8,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "text": [
+            "[nltk_data] Downloading package wordnet to /root/nltk_data...\n",
+            "[nltk_data]   Unzipping corpora/wordnet.zip.\n"
+          ],
+          "name": "stdout"
+        }
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "O8qLsyhEvtuQ"
+      },
+      "source": [
+        "# Generate Context/Target pairs for training samples"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "mgb30XUC4HWP"
+      },
+      "source": [
+        "The idea behind CBOW is to use the surrounding context words to create target vectors that most closely resemble the label vectors. Therefore we need to create a rolling window over our text and take out the middle word. This means we get a list of context words: [n-2, n-1, n+1, n+2] for every target word [n]."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "eCrUW5924OE2"
+      },
+      "source": [
+        "def processfiles(all_texts, questions=questions, config={\"stop\":True, \"window_size\":4}):\n",
+        "  window = config['window_size']\n",
+        "  vocab = set()\n",
+        "  contexts,targets=[],[]\n",
+        "  stop = set(stopwords.words('english') + list(string.punctuation))\n",
+        "  for text in all_texts:\n",
+        "    if config['stop']:\n",
+        "      tokenized_text = [i for i in word_tokenize(text.lower()) if i not in stop]\n",
+        "    else:\n",
+        "      tokenized_text = [i for i in word_tokenize(text.lower())]\n",
+        "    vocab.update(tokenized_text)\n",
+        "    for i in range(window, len(tokenized_text) - window - 1):\n",
+        "      contexts.append(tokenized_text[i-window:i] + tokenized_text[i+1:i+window+1])\n",
+        "      targets.append(tokenized_text[i])\n",
+        "  train = pd.DataFrame()\n",
+        "  train['contexts']=contexts\n",
+        "  train['targets']=targets\n",
+        "  # naively handle out-of-vocab errors by addding question text to vocab\n",
+        "  for i,row in questions.iterrows():\n",
+        "    stop = set(stopwords.words('english') + list(string.punctuation))\n",
+        "    if config['stop']==True:\n",
+        "      question_tokens = [i for i in word_tokenize(row.question.lower()) if i not in stop]\n",
+        "    else:\n",
+        "      question_tokens = [i for i in word_tokenize(row.question.lower())]\n",
+        "    vocab.update(question_tokens)\n",
+        "    vocab.update(list(row[choices]))\n",
+        "  return train, vocab"
+      ],
+      "execution_count": 9,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "pO6d0qnJ4Pb-"
+      },
+      "source": [
+        "train, vocab = processfiles(texts,config={\"stop\":True, \"window_size\":4})"
+      ],
+      "execution_count": 10,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "zviVZziQdN0q",
+        "outputId": "996f6eb7-a9d0-4b09-9ce0-393c80b4f371"
+      },
+      "source": [
+        "train.iloc[100].contexts"
+      ],
+      "execution_count": 11,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "['death', 'spouse', 'hath', 'chance', 'whereby', 'decays', 'thing', 'save']"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 11
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "RwtII2Dx_eOs",
+        "outputId": "820b3c35-a0f5-4cfd-cadd-bb69a2c6b9f0"
+      },
+      "source": [
+        "len(train)"
+      ],
+      "execution_count": 12,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "1860555"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 12
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "XJ1W40uSw15a"
+      },
+      "source": [
+        "word_to_ix = "
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "9QuhJ6WZ3WC9"
+      },
+      "source": [
+        "# Pytorch lightning"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "UoeS4ql6B_-o"
+      },
+      "source": [
+        "import pytorch_lightning as pl\n",
+        "import torch\n",
+        "from torch.utils.data import Dataset, DataLoader\n",
+        "import pandas as pd"
+      ],
+      "execution_count": 13,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "mUqPQ1Nu3ifK"
+      },
+      "source": [
+        "class PLDataset(Dataset):\n",
+        "\n",
+        "  def __init__(self, data: pd.DataFrame, vocab: dict):\n",
+        "    self.data = data\n",
+        "    self.vocab = vocab\n",
+        "\n",
+        "  def __len__(self):\n",
+        "    return len(self.data)\n",
+        "\n",
+        "  def __getitem__(self, index: int):\n",
+        "    row = self.data.iloc[index]\n",
+        "    context = row.contexts\n",
+        "    target = row.targets\n",
+        "    return {'context_ids':torch.tensor([self.vocab[w] for w in context], dtype=torch.long),\n",
+        "            'target_id':torch.tensor(self.vocab[target], dtype=torch.long)}"
+      ],
+      "execution_count": 14,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "TAmzlNlxdNGL",
+        "outputId": "855e9eb3-5b6b-4c72-cd13-9ebb099b50af"
+      },
+      "source": [
+        "word_to_ix = {word: i for i, word in enumerate(vocab)}\n",
+        "test = PLDataset(train.head(), word_to_ix)\n",
+        "test.__getitem__(0)"
+      ],
+      "execution_count": 19,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "{'context_ids': tensor([19928, 48166, 43142, 41909, 33301, 13391, 64107, 41909]),\n",
+              " 'target_id': tensor(6050)}"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 19
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "VupJo10Mi8Ns"
+      },
+      "source": [
+        "class PLTestDataset(Dataset):\n",
+        "\n",
+        "  def __init__(self, data: pd.DataFrame, vocab: dict, window: int=4):\n",
+        "    self.data = data\n",
+        "    self.vocab = vocab\n",
+        "    self.window = window\n",
+        "    self.stop = set(stopwords.words('english') + list(string.punctuation))\n",
+        "\n",
+        "  def __len__(self):\n",
+        "    return len(self.data)\n",
+        "\n",
+        "  def __getitem__(self, index: int, target=\"_____\"):\n",
+        "    row = self.data.iloc[index]\n",
+        "    question = row.question\n",
+        "    answer = row.answer.lower()\n",
+        "    question_tokens = [i for i in word_tokenize(question.lower()) if i not in self.stop]\n",
+        "    window_left,window_right = self.window,self.window\n",
+        "    for i,word in enumerate(question_tokens):\n",
+        "      if word == target:\n",
+        "        if i<window_left:\n",
+        "          window_right = window_right+(window_left-1)\n",
+        "        if i>(len(question_tokens)-window_right):\n",
+        "          window_left = window_left+(len(question_tokens)-i)\n",
+        "        context = question_tokens[i-window_left+1:i]+question_tokens[i+1:i+1+window_right]\n",
+        "        break\n",
+        "    return {'context_ids':torch.tensor([self.vocab[w] for w in context], dtype=torch.long),\n",
+        "            'target_id':torch.tensor(self.vocab[answer], dtype=torch.long)}"
+      ],
+      "execution_count": 20,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "THYtS1tZL8LV",
+        "outputId": "d89603d3-7fd5-4816-92c8-fa1b3c43a148"
+      },
+      "source": [
+        "test = PLTestDataset(questions.head(), word_to_ix)\n",
+        "test.__getitem__(1)"
+      ],
+      "execution_count": 21,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "{'context_ids': tensor([ 9992, 18020,    59,  2012, 19932, 65587]),\n",
+              " 'target_id': tensor(62159)}"
+            ]
+          },
+          "metadata": {
+            "tags": []
+          },
+          "execution_count": 21
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "yHfE3gbD3YDw"
+      },
+      "source": [
+        "class PLDataModule(pl.LightningDataModule):\n",
+        "\n",
+        "  def __init__(self, train_data, test_data, batch_size=16, vocab=word_to_ix, window=4):\n",
+        "    super().__init__()\n",
+        "    print(len(train_data))\n",
+        "    self.train_data = train_data\n",
+        "    self.test_data = test_data\n",
+        "    self.batch_size = batch_size\n",
+        "    self.vocab = vocab\n",
+        "    self.window = window\n",
+        "\n",
+        "  def setup(self):\n",
+        "    self.train_dataset = PLDataset(\n",
+        "        self.train_data,\n",
+        "        self.vocab\n",
+        "    )\n",
+        "    self.test_dataset = PLTestDataset(\n",
+        "        self.test_data,\n",
+        "        self.vocab,\n",
+        "        self.window\n",
+        "    )\n",
+        "\n",
+        "  def train_dataloader(self):\n",
+        "    return DataLoader(\n",
+        "        self.train_dataset,\n",
+        "        batch_size=self.batch_size,\n",
+        "        shuffle=True,\n",
+        "        num_workers=2\n",
+        "    )\n",
+        "\n",
+        "  def val_dataloader(self):\n",
+        "    return DataLoader(self.test_dataset,batch_size=1,num_workers=2)\n",
+        "  def test_dataloader(self):\n",
+        "    return DataLoader(self.test_dataset,batch_size=1,num_workers=2)"
+      ],
+      "execution_count": 22,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "zYFuV0AAQOWb"
+      },
+      "source": [
+        "class CBOWModel(pl.LightningModule):\n",
+        "\n",
+        "  def __init__(self, config, vocab):\n",
+        "    super().__init__()\n",
+        "    self.config = config\n",
+        "    self.vocab = vocab\n",
+        "    self.embeddings = nn.Embedding(num_embeddings=config['vocab_size'],embedding_dim=config['embedding_dim'])\n",
+        "    self.linear = nn.Linear(in_features=config['embedding_dim'],out_features=config['vocab_size'])\n",
+        "    torch.nn.init.xavier_normal_(self.linear.weight)\n",
+        "    self.accuracy = pl.metrics.Accuracy()\n",
+        "    self.loss_function = nn.NLLLoss()\n",
+        "\n",
+        "  def forward(self, inputs, target=None):\n",
+        "    embeds = torch.mean(self.embeddings(inputs), dim=1)\n",
+        "    # print(embeds.shape)\n",
+        "    logits = self.linear(embeds)\n",
+        "    # print(logits.shape)\n",
+        "    out = F.log_softmax(logits, dim=1)\n",
+        "    loss = 0\n",
+        "    if target is not None:   \n",
+        "      loss = self.loss_function(out, target)\n",
+        "    return loss, logits\n",
+        "\n",
+        "  def training_step(self, batch, batch_index):\n",
+        "    context_ids = batch['context_ids']\n",
+        "    target_id = batch['target_id']\n",
+        "    loss, outputs = self(context_ids, target_id)\n",
+        "    self.log(\"train loss \", loss, prog_bar = True, logger=True)\n",
+        "    return {\"loss\":loss}\n",
+        "\n",
+        "  def validation_step(self, batch, batch_index):\n",
+        "    context_ids = batch['context_ids']\n",
+        "    target_id = batch['target_id']\n",
+        "    loss, outputs = self(context_ids, target_id)\n",
+        "    self.log(\"validation loss \", loss, prog_bar = True, logger=True)\n",
+        "    return {\"val_loss\": loss, \"val_outputs\": outputs}\n",
+        "\n",
+        "  def validation_epoch_end(self, outputs):\n",
+        "    avg_loss = torch.stack([x[\"val_loss\"] for x in outputs]).mean()\n",
+        "    all_outputs = [x[\"val_outputs\"] for x in outputs]\n",
+        "    preds=[]\n",
+        "    for output in all_outputs:\n",
+        "      for i,row in questions.iterrows():\n",
+        "        choice_ids = [self.vocab[row[c]] for c in choices]\n",
+        "        choice_logits = [float(output[0, id]) for id in choice_ids]\n",
+        "        preds.append(np.argmax(np.array(choice_logits)))\n",
+        "\n",
+        "    total,correct=0,0\n",
+        "    for answer,pred in zip(answers.answer, preds):\n",
+        "      total+=1\n",
+        "      if answer==choices[pred]:\n",
+        "        correct+=1\n",
+        "    print(f\"test accuracy {correct/total}\")\n",
+        "    self.log(\"ptl/val_loss\", avg_loss)\n",
+        "    self.log(\"ptl/val_accuracy\", correct/total)\n",
+        "\n",
+        "  def test_step(self, batch, batch_index):\n",
+        "    pass\n",
+        "  \n",
+        "  def training_epoch_end(self, outputs):\n",
+        "    pass\n",
+        "\n",
+        "  def configure_optimizers(self):\n",
+        "    optimizer = optim.AdamW(self.parameters(), lr=self.config['lr'])\n",
+        "    return optimizer\n"
+      ],
+      "execution_count": 23,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "eKe4sKLpfR-B"
+      },
+      "source": [
+        "Standalone"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "3cCta7b__SQV"
+      },
+      "source": [
+        "  config = {\n",
+        "  \"lr\": 2e-5,\n",
+        "  \"batch_size\": 128,\n",
+        "  \"embedding_dim\":256,\n",
+        "  \"vocab_size\":len(vocab),\n",
+        "  \"n_epochs\":6,\n",
+        "  \"stop\":False\n",
+        "  }\n",
+        "  print(\"Training set size: {}\".format(len(train)))\n",
+        "  print(\"Vocab set size: {}\".format(len(vocab)))\n",
+        "  model = CBOWModel(config, vocab=word_to_ix)\n",
+        "  data_module = PLDataModule(train, questions, batch_size=config['batch_size'],vocab=word_to_ix)\n",
+        "  data_module.setup()\n",
+        "  trainer = pl.Trainer(max_epochs=config['n_epochs'],gpus=1,progress_bar_refresh_rate=100)\n",
+        "  trainer.fit(model, data_module)"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "ARmRjAn7_OrU"
+      },
+      "source": [
+        "# Hyper-Pararmeter Tuning with Ray Tune"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "976xgyjNzdPe"
+      },
+      "source": [
+        "callback = TuneReportCallback({\n",
+        "    \"accuracy\": \"ptl/val_accuracy\",\n",
+        "    \"loss\": \"ptl/val_loss\",\n",
+        "}, on=\"validation_end\")"
+      ],
+      "execution_count": 25,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "Lm_raa71u_LN"
+      },
+      "source": [
+        "def train_tune(config, gpus=0):\n",
+        "  train, vocab = processfiles(texts, config=config)\n",
+        "  word_to_ix = {word: i for i, word in enumerate(vocab)}\n",
+        "  print(\"Training set size: {}\".format(len(train)))\n",
+        "  model = CBOWModel(config,vocab=word_to_ix)\n",
+        "  data_module = PLDataModule(train, questions, vocab=word_to_ix, batch_size=config['batch_size'])\n",
+        "  print(\"Steps per epoch {}\".format(len(train)/config['batch_size']))\n",
+        "  data_module.setup()\n",
+        "  trainer = pl.Trainer(max_epochs=5,gpus=config[\"n_gpus\"],progress_bar_refresh_rate=1000,\n",
+        "                       logger=TensorBoardLogger(save_dir=tune.get_trial_dir(), name=\"\", version=\".\"),\n",
+        "                       callbacks=[callback])\n",
+        "  trainer.fit(model, data_module)"
+      ],
+      "execution_count": 26,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "P5c10CE6vJry"
+      },
+      "source": [
+        "def tune_cbow(config, num_samples=3, gpus_per_trial=0):\n",
+        "  scheduler = ASHAScheduler(\n",
+        "      metric='accuracy',\n",
+        "      mode='max',\n",
+        "      grace_period=3,\n",
+        "      reduction_factor=2)\n",
+        "\n",
+        "  reporter = CLIReporter(\n",
+        "      parameter_columns=[\"lr\", \"batch_size\", \"embedding_dim\", 'stop', \"window_size\"],\n",
+        "      metric_columns=[\"loss\", \"accuracy\", \"training_iteration\"])\n",
+        "\n",
+        "  trainable = tune.with_parameters(\n",
+        "      train_tune,\n",
+        "      gpus=config[\"n_gpus\"])\n",
+        "  analysis = tune.run(\n",
+        "      trainable,\n",
+        "      resources_per_trial={\n",
+        "          \"cpu\": 1,\n",
+        "          \"gpu\": config[\"n_gpus\"]\n",
+        "      },\n",
+        "      config=config,\n",
+        "      scheduler=scheduler,\n",
+        "      progress_reporter=reporter,\n",
+        "      num_samples=num_samples,\n",
+        "      name=\"tune_cbow\")"
+      ],
+      "execution_count": 27,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "EK8c-jfBwauP"
+      },
+      "source": [
+        "config = {\n",
+        "  \"lr\": tune.choice([2e-6,2e-5,2e-4]),\n",
+        "  \"batch_size\": 64,\n",
+        "  \"embedding_dim\":tune.choice([64,128,256]),\n",
+        "  \"vocab_size\":len(vocab),\n",
+        "  \"n_epochs\":20,\n",
+        "  \"stop\":tune.choice([True, False]),\n",
+        "  \"window_size\":tune.choice([2,3,4,5,10]),\n",
+        "  \"n_gpus\":1\n",
+        "}"
+      ],
+      "execution_count": 28,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "SuQWPZSfwaws",
+        "outputId": "afb2c6f1-364f-4181-f50d-c935f338ae46"
+      },
+      "source": [
+        " import numpy as np\n",
+        " analysis = tune_cbow(config, num_samples=10)"
+      ],
+      "execution_count": 29,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "text": [
+            "2021-07-10 09:35:12,591\tINFO services.py:1274 -- View the Ray dashboard at \u001b[1m\u001b[32mhttp://127.0.0.1:8265\u001b[39m\u001b[22m\n",
+            "2021-07-10 09:35:14,834\tWARNING function_runner.py:545 -- Function checkpointing is disabled. This may result in unexpected behavior when using checkpointing features or certain schedulers. To enable, set the train function arguments to be `func(config, checkpoint_dir=None)`.\n",
+            "2021-07-10 09:35:17,447\tWARNING worker.py:1123 -- Warning: The actor ImplicitFunc has size 21249179 when pickled. It will be stored in Redis, which could cause memory issues. This may mean that its definition uses a large array or other object.\n"
+          ],
+          "name": "stderr"
+        },
+        {
+          "output_type": "stream",
+          "text": [
+            "== Status ==\n",
+            "Memory usage on this node: 3.7/12.7 GiB\n",
+            "Using AsyncHyperBand: num_stopped=0\n",
+            "Bracket: Iter 96.000: None | Iter 48.000: None | Iter 24.000: None | Iter 12.000: None | Iter 6.000: None | Iter 3.000: None\n",
+            "Resources requested: 1.0/2 CPUs, 1.0/1 GPUs, 0.0/7.32 GiB heap, 0.0/3.66 GiB objects (0.0/1.0 accelerator_type:V100)\n",
+            "Result logdir: /root/ray_results/tune_cbow\n",
+            "Number of trials: 10/10 (9 PENDING, 1 RUNNING)\n",
+            "+------------------------+----------+-------+--------+--------------+-----------------+--------+---------------+\n",
+            "| Trial name             | status   | loc   |     lr |   batch_size |   embedding_dim | stop   |   window_size |\n",
+            "|------------------------+----------+-------+--------+--------------+-----------------+--------+---------------|\n",
+            "| train_tune_21a5e_00000 | RUNNING  |       | 2e-05  |           64 |             128 | False  |            10 |\n",
+            "| train_tune_21a5e_00001 | PENDING  |       | 2e-05  |           64 |              64 | False  |             5 |\n",
+            "| train_tune_21a5e_00002 | PENDING  |       | 2e-06  |           64 |             256 | False  |             4 |\n",
+            "| train_tune_21a5e_00003 | PENDING  |       | 0.0002 |           64 |             128 | True   |             5 |\n",
+            "| train_tune_21a5e_00004 | PENDING  |       | 2e-05  |           64 |             256 | True   |             4 |\n",
+            "| train_tune_21a5e_00005 | PENDING  |       | 2e-05  |           64 |              64 | True   |             3 |\n",
+            "| train_tune_21a5e_00006 | PENDING  |       | 2e-05  |           64 |             128 | True   |             3 |\n",
+            "| train_tune_21a5e_00007 | PENDING  |       | 2e-05  |           64 |             256 | True   |            10 |\n",
+            "| train_tune_21a5e_00008 | PENDING  |       | 2e-05  |           64 |             256 | True   |             4 |\n",
+            "| train_tune_21a5e_00009 | PENDING  |       | 2e-05  |           64 |             256 | True   |             3 |\n",
+            "+------------------------+----------+-------+--------+--------------+-----------------+--------+---------------+\n",
+            "\n",
+            "\n",
+            "== Status ==\n",
+            "Memory usage on this node: 3.9/12.7 GiB\n",
+            "Using AsyncHyperBand: num_stopped=0\n",
+            "Bracket: Iter 96.000: None | Iter 48.000: None | Iter 24.000: None | Iter 12.000: None | Iter 6.000: None | Iter 3.000: None\n",
+            "Resources requested: 1.0/2 CPUs, 1.0/1 GPUs, 0.0/7.32 GiB heap, 0.0/3.66 GiB objects (0.0/1.0 accelerator_type:V100)\n",
+            "Result logdir: /root/ray_results/tune_cbow\n",
+            "Number of trials: 10/10 (9 PENDING, 1 RUNNING)\n",
+            "+------------------------+----------+-------+--------+--------------+-----------------+--------+---------------+\n",
+            "| Trial name             | status   | loc   |     lr |   batch_size |   embedding_dim | stop   |   window_size |\n",
+            "|------------------------+----------+-------+--------+--------------+-----------------+--------+---------------|\n",
+            "| train_tune_21a5e_00000 | RUNNING  |       | 2e-05  |           64 |             128 | False  |            10 |\n",
+            "| train_tune_21a5e_00001 | PENDING  |       | 2e-05  |           64 |              64 | False  |             5 |\n",
+            "| train_tune_21a5e_00002 | PENDING  |       | 2e-06  |           64 |             256 | False  |             4 |\n",
+            "| train_tune_21a5e_00003 | PENDING  |       | 0.0002 |           64 |             128 | True   |             5 |\n",
+            "| train_tune_21a5e_00004 | PENDING  |       | 2e-05  |           64 |             256 | True   |             4 |\n",
+            "| train_tune_21a5e_00005 | PENDING  |       | 2e-05  |           64 |              64 | True   |             3 |\n",
+            "| train_tune_21a5e_00006 | PENDING  |       | 2e-05  |           64 |             128 | True   |             3 |\n",
+            "| train_tune_21a5e_00007 | PENDING  |       | 2e-05  |           64 |             256 | True   |            10 |\n",
+            "| train_tune_21a5e_00008 | PENDING  |       | 2e-05  |           64 |             256 | True   |             4 |\n",
+            "| train_tune_21a5e_00009 | PENDING  |       | 2e-05  |           64 |             256 | True   |             3 |\n",
+            "+------------------------+----------+-------+--------+--------------+-----------------+--------+---------------+\n",
+            "\n",
+            "\n"
+          ],
+          "name": "stdout"
+        },
+        {
+          "output_type": "stream",
+          "text": [
+            "2021-07-10 09:35:23,840\tWARNING tune.py:507 -- SIGINT received (e.g. via Ctrl+C), ending Ray Tune run. This will try to checkpoint the experiment state one last time. Press CTRL+C one more time (or send SIGINT/SIGKILL/SIGTERM) to skip. \n"
+          ],
+          "name": "stderr"
+        },
+        {
+          "output_type": "stream",
+          "text": [
+            "== Status ==\n",
+            "Memory usage on this node: 4.0/12.7 GiB\n",
+            "Using AsyncHyperBand: num_stopped=0\n",
+            "Bracket: Iter 96.000: None | Iter 48.000: None | Iter 24.000: None | Iter 12.000: None | Iter 6.000: None | Iter 3.000: None\n",
+            "Resources requested: 1.0/2 CPUs, 1.0/1 GPUs, 0.0/7.32 GiB heap, 0.0/3.66 GiB objects (0.0/1.0 accelerator_type:V100)\n",
+            "Result logdir: /root/ray_results/tune_cbow\n",
+            "Number of trials: 10/10 (9 PENDING, 1 RUNNING)\n",
+            "+------------------------+----------+-------+--------+--------------+-----------------+--------+---------------+\n",
+            "| Trial name             | status   | loc   |     lr |   batch_size |   embedding_dim | stop   |   window_size |\n",
+            "|------------------------+----------+-------+--------+--------------+-----------------+--------+---------------|\n",
+            "| train_tune_21a5e_00000 | RUNNING  |       | 2e-05  |           64 |             128 | False  |            10 |\n",
+            "| train_tune_21a5e_00001 | PENDING  |       | 2e-05  |           64 |              64 | False  |             5 |\n",
+            "| train_tune_21a5e_00002 | PENDING  |       | 2e-06  |           64 |             256 | False  |             4 |\n",
+            "| train_tune_21a5e_00003 | PENDING  |       | 0.0002 |           64 |             128 | True   |             5 |\n",
+            "| train_tune_21a5e_00004 | PENDING  |       | 2e-05  |           64 |             256 | True   |             4 |\n",
+            "| train_tune_21a5e_00005 | PENDING  |       | 2e-05  |           64 |              64 | True   |             3 |\n",
+            "| train_tune_21a5e_00006 | PENDING  |       | 2e-05  |           64 |             128 | True   |             3 |\n",
+            "| train_tune_21a5e_00007 | PENDING  |       | 2e-05  |           64 |             256 | True   |            10 |\n",
+            "| train_tune_21a5e_00008 | PENDING  |       | 2e-05  |           64 |             256 | True   |             4 |\n",
+            "| train_tune_21a5e_00009 | PENDING  |       | 2e-05  |           64 |             256 | True   |             3 |\n",
+            "+------------------------+----------+-------+--------+--------------+-----------------+--------+---------------+\n",
+            "\n",
+            "\n"
+          ],
+          "name": "stdout"
+        },
+        {
+          "output_type": "stream",
+          "text": [
+            "2021-07-10 09:35:24,069\tERROR tune.py:545 -- Trials did not complete: [train_tune_21a5e_00000, train_tune_21a5e_00001, train_tune_21a5e_00002, train_tune_21a5e_00003, train_tune_21a5e_00004, train_tune_21a5e_00005, train_tune_21a5e_00006, train_tune_21a5e_00007, train_tune_21a5e_00008, train_tune_21a5e_00009]\n",
+            "2021-07-10 09:35:24,071\tINFO tune.py:549 -- Total run time: 9.24 seconds (8.55 seconds for the tuning loop).\n",
+            "2021-07-10 09:35:24,074\tWARNING tune.py:554 -- Experiment has been interrupted, but the most recent state was saved. You can continue running this experiment by passing `resume=True` to `tune.run()`\n"
+          ],
+          "name": "stderr"
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "_XY_xcGHwazA"
+      },
+      "source": [
+        "%load_ext tensorboard\n",
+        "%tensorboard --logdir ~/ray_results"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "j5DjJroeq3wQ"
+      },
+      "source": [
+        "test = torch.tensor([ word_to_ix['went'], word_to_ix['city'], word_to_ix['walking'], word_to_ix['streets'], word_to_ix['capital'], word_to_ix['building']])\n",
+        "test.shape"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "oE5XDIWLfq34"
+      },
+      "source": [
+        "loss, log_probs = model(torch.unsqueeze(test, dim=0))"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "5qu5iv-c9dn9"
+      },
+      "source": [
+        "torch.argmax(log_probs)\n",
+        "ix_to_word = dict((v,k) for k,v in word_to_ix.items())\n",
+        "ix_to_word[int(torch.argmax(log_probs))]"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "SIXmGQYU_OAY"
+      },
+      "source": [
+        "# Test Data - (MRSCC Data)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "SCe3o2FQ_NP_"
+      },
+      "source": [
+        "class question:\n",
+        "    \n",
+        "    def __init__(self, aline, lm):\n",
+        "        self.sentence=aline[1]\n",
+        "        self.choices = [\"a\", \"b\", \"c\", \"d\", \"e\"]\n",
+        "        self.word_choices = {index:word for index,word in zip(self.choices,aline[2:])}\n",
+        "        self.model = model\n",
+        "\n",
+        "    def add_answer(self,fields):\n",
+        "        self.answer=fields[1]\n",
+        "\n",
+        "    def get_window_context(self,sent_tokens,window_left, window_right,target=\"_____\"):\n",
+        "        stop = set(stopwords.words('english') + list(string.punctuation))\n",
+        "        # print(sent_tokens)\n",
+        "        tokens = [i for i in word_tokenize(sent_tokens.lower()) if i not in stop]\n",
+        "        # print(tokens)\n",
+        "\n",
+        "        for i,token in enumerate(tokens):\n",
+        "            if token==target:\n",
+        "              if i<window_left:\n",
+        "                # print('changing right win')\n",
+        "                window_right = window_right+(window_left-1)\n",
+        "              if i>(len(tokens)-window_right):\n",
+        "                # print('changing left win')\n",
+        "                window_left = window_left+(len(tokens)-i)\n",
+        "            # print(window_left)\n",
+        "            # print(window_right)\n",
+        "            # print(tokens[i-window_left:])\n",
+        "            return tokens[i-window_left+1:i]+tokens[i:i+window_right]\n",
+        "        else:\n",
+        "            return []\n",
+        "\n",
+        "    def predict(self, window=2):\n",
+        "      #  get left words\n",
+        "        # print(self.sentence)\n",
+        "        context = self.get_window_context(self.sentence, window, window)\n",
+        "        context = torch.tensor([word_to_ix[w] for w in context])\n",
+        "        _, log_probs = model(torch.unsqueeze(context, dim=0), target=None)\n",
+        "      # get rid of extra dimension\n",
+        "        log_probs = torch.squeeze(log_probs)\n",
+        "      # which of the 5 word choices has the highest probability given this\n",
+        "      # first convert words to ids\n",
+        "        choice_ids = {index:word_to_ix[word] for index,word in self.word_choices.items() if word in word_to_ix.keys()}\n",
+        "      # turn ids into probabilities given model\n",
+        "        choice_probs = {index:float(log_probs[id]) for index, id in choice_ids.items()}\n",
+        "      # choose max prediciton\n",
+        "        prediction = max(choice_probs, key=choice_probs.get)\n",
+        "        return prediction\n",
+        "        \n",
+        "    def predict_and_score(self):\n",
+        "        #compare prediction according to method with the correct answer\n",
+        "        #return 1 or 0 accordingly\n",
+        "        prediction=self.predict()\n",
+        "        if prediction == self.answer:\n",
+        "            return 1\n",
+        "        else:\n",
+        "            return 0 "
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "EVdM9FgLABZG"
+      },
+      "source": [
+        "class scc_reader:\n",
+        "    \n",
+        "    def __init__(self, model, qs=questions, ans=answers):\n",
+        "        self.qs=qs\n",
+        "        self.ans=ans\n",
+        "        self.model = model\n",
+        "        self.read_files()\n",
+        "   \n",
+        "    def read_files(self):\n",
+        "        #create a question instance for each line of the file (other than heading line)\n",
+        "        self.questions=[question(questions.iloc[i], self.model) for i in range(len(questions))]\n",
+        "        #add answers to questions so predictions can be checked    \n",
+        "        for i,q in enumerate(self.questions):\n",
+        "            q.add_answer(answers.iloc[i])\n",
+        "        \n",
+        "    def get_field(self,field):\n",
+        "        return [q.get_field(field) for q in self.questions] \n",
+        "    \n",
+        "    def predict(self):\n",
+        "        return [q.predict() for q in self.questions]\n",
+        "    \n",
+        "    def predict_and_score(self):\n",
+        "        scores=[q.predict_and_score() for q in self.questions]\n",
+        "        return sum(scores)/len(scores)"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "2Ucy1QLUCrtq"
+      },
+      "source": [
+        "SCC = scc_reader(model=model)"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "-bgRKPNeVOOd"
+      },
+      "source": [
+        "SCC.predict_and_score()"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "uUgaJzBDZhbv"
+      },
+      "source": [
+        "t = torch.squeeze(log_probs)"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "lt5QXyCWNpF3"
+      },
+      "source": [
+        "questions.head()"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "naL0sCAIYLlO"
+      },
+      "source": [
+        "float(t[0])"
+      ],
+      "execution_count": null,
+      "outputs": []
+    }
+  ]
+}
